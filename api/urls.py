@@ -1,7 +1,7 @@
-from django.urls import path
-from .views import *
+from django.contrib import admin
+from django.urls import path, include
 
 urlpatterns = [
-     path("blogposts/", BlogPostListCreate.as_view(),name="blogpost-view-create"),
-     path("blogposts/<int:pk>/", BlogPostListView.as_view(),name="update")
+    path('admin/', admin.site.urls),
+    path('api/', include('myproject.urls')),  # Include API URLs
 ]

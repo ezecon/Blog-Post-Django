@@ -1,58 +1,61 @@
+from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework import generics, status
-from .models import BlogPost
-from .serializers import BlogPostSerializer
+from rest_framework.parsers import MultiPartParser, FormParser
+import os
+import numpy as np
+import cv2
+from tensorflow.keras.models import load_model
+from django.conf import settings
 
-class BlogPostListCreate(generics.ListCreateAPIView):
-    queryset = BlogPost.objects.all()
-    serializer_class = BlogPostSerializer
+# Load the model
+MODEL_PATH = os.path.join(settings.BASE_DIR, 'predictor/models/model.h5')
+model = load_model(MODEL_PATH)
+CLASS_NAMES = ['Disease A', 'Disease B', 'Disease C', 'Disease D']
 
-    def list(self, request, *args, **kwargs):
-        queryset = self.get_queryset()
-        serializer = self.get_serializer(queryset, many=True)
-        return Response({
-            "status": status.HTTP_200_OK,
-            "data": serializer.data
-        }, status=status.HTTP_200_OK)
+class PredictDiseaseView(APIView):
+    parser_classes = [MultiPartParser, FormParser]
 
-    def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        self.perform_create(serializer)
-        return Response({
-            "status": status.HTTP_201_CREATED,
-            "data": serializer.data
-        }, status=status.HTTP_201_CREATED)
-    
-    
-class BlogPostListView(generics.RetrieveUpdateDestroyAPIView):
-    queryset = BlogPost.objects.all()
-    serializer_class = BlogPostSerializer
-    lookup_field = "pk"
+    def post(self, request, *args, **kwargs):
+        if 'image' not in request.data:
+            return Response({'error': 'No image provided.'}, status=400)
+        
+        try:
+            # Get the uploaded image
+            uploaded_file = request.data['image']
+            temp_path = os.path.join(settings.MEDIA_ROOT, uploaded_file.name)
+            with open(temp_path, 'wb+') as f:
+                for chunk in uploaded_file.chunks():
+                    f.write(chunk)
 
-    def retrieve(self, request, *args, **kwargs):
-        instance = self.get_object()
-        serializer = self.get_serializer(instance)
-        return Response({
-            "status": status.HTTP_200_OK,
-            "data": serializer.data
-        }, status=status.HTTP_200_OK)
+            # Preprocess the image
+            image = cv2.imread(temp_path)
+            gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            image_size = (224, 224)  # Replace with your model's input size
+            resized_image = cv2.resize(gray_image, image_size)
+            equalized_image = cv2.equalizeHist(resized_image)
+            denoised_image = cv2.medianBlur(equalized_image, ksize=3)
+            kernel = np.ones((3, 3), np.uint8)
+            eroded_image = cv2.erode(denoised_image, kernel, iterations=1)
+            morph_image = cv2.dilate(eroded_image, kernel, iterations=1)
+            pixel_values = morph_image.reshape((-1, 1))
+            pixel_values = np.float32(pixel_values)
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+            _, labels, centers = cv2.kmeans(pixel_values, 2, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+            segmented_image = centers[labels.flatten()].reshape(morph_image.shape)
 
-    def update(self, request, *args, **kwargs):
-        partial = kwargs.pop('partial', False)
-        instance = self.get_object()
-        serializer = self.get_serializer(instance, data=request.data, partial=partial)
-        serializer.is_valid(raise_exception=True)
-        self.perform_update(serializer)
-        return Response({
-            "status": status.HTTP_200_OK,
-            "data": serializer.data
-        }, status=status.HTTP_200_OK)
+            # Normalize and prepare input
+            segmented_image = segmented_image / 255.0
+            segmented_image = np.expand_dims(segmented_image, axis=-1)
+            segmented_image = np.expand_dims(segmented_image, axis=0)
 
-    def destroy(self, request, *args, **kwargs):
-        instance = self.get_object()
-        self.perform_destroy(instance)
-        return Response({
-            "status": status.HTTP_204_NO_CONTENT,
-            "message": "Deleted successfully"
-        }, status=status.HTTP_204_NO_CONTENT)
+            # Predict
+            predictions = model.predict(segmented_image)
+            predicted_class = CLASS_NAMES[np.argmax(predictions)]
+            confidence = np.max(predictions)
+
+            os.remove(temp_path)
+
+            return Response({'class': predicted_class, 'confidence': float(confidence)})
+
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
